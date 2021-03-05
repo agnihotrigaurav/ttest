@@ -1,32 +1,305 @@
+source-dir: src
 box:
-  id: golang
-  ports:
-    - "5000"
+  id: iad.ocir.io/odx-pipelines/wercker/node12-instantclient12-2
+  tag: 1.0
+  registry: https://iad.ocir.io/v2
+  username: ${OCIR_USERNAME}
+  password: ${OCIR_PASSWORD}
+no-response-timeout: 10
 
 dev:
+  box:
+    id: quay.io/wercker/wercker-dev:$WERCKER_GIT_BRANCH
+    username: $DOCKER_USERNAME
+    password: $DOCKER_PASSWORD
+    registry: quay.io
+  services:
+      - mongo:3.2
   steps:
-    - internal/watch:
-        code: |
-          go build ./...
-          ./source
-        reload: true
+    - add-ssh-key:
+        keyname: WERCKER_COMMON
+        host: github.com
 
-# Build definition
+    - script:
+        name: setup env
+        code: |
+          export WERCKER_MONGODB_HOST=${MONGO_PORT:6}
+          export mongodbUrl="mongodb://$WERCKER_MONGODB_HOST/wercker"
+          export PATH=$PATH:$WERCKER_SOURCE_DIR/node_modules/.bin/
+          export NODE_ENV=development
+          rm -rf ./node_modules
+          ln -s /dist/node_modules ./
+    - script:
+        name: fetch and install mongo fixtures
+        code: |
+          ./load_fixtures.sh
+    - internal/shell:
+        code: |
+          yarn start
+    - script:
+        name: cleanup symlinks
+        code: |
+          rm ./node_modules
 build:
-  # The steps that will be executed on build
+  services:
+      - mongo:3.2
   steps:
-
-    # golint step!
-    - wercker/golint
-
-    # Build the project
     - script:
-        name: go build
+        name: restore cache-loader folder
         code: |
-          go build ./...
+          echo "Contents of the cache dir"
+          du -h -d1 $WERCKER_CACHE_DIR
+          ls -p | grep -v /
+          # copy previous cache-loader folder over if exists
+          if [ -f "$WERCKER_CACHE_DIR/.cache-loader" ]; then
+            echo ".cache-loader folder restored!"
+            mv "$WERCKER_CACHE_DIR/.cache-loader" .
+          fi
+    - add-ssh-key:
+        keyname: WERCKER_COMMON
+        host: github.com
 
-    # Test the project
+    - add-to-known_hosts:
+        hostname: github.com
+        fingerprint: nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8
+
     - script:
-        name: go test
+        name: update git submodules
         code: |
-          go test ./...
+          cd ..
+          git submodule update --init --recursive
+    - script:
+        name: yarn install
+        code: |
+          yarn --pure-lockfile --cache-folder $WERCKER_CACHE_DIR
+          cp yarn.lock $WERCKER_REPORT_ARTIFACTS_DIR
+    - script:
+        name: lint formatting
+        code: |
+            yarn run prettier-lint
+    - script:
+        name: lint code
+        code: |
+            yarn run lint
+    - script:
+        name: run flow
+        code: |
+            yarn run flow
+    - script:
+        name: check licenses
+        code: yarn run license-check
+
+    - script:
+        name: compile hbs helpers for emails
+        code: |
+          # this compilation is required to ensure tests succeed
+          yarn run build-helpers
+    - script:
+        name: nodeunit tests
+        code: |
+          export WERCKER_MONGODB_HOST=${MONGO_PORT:6}
+          export mongodbUrl="mongodb://$WERCKER_MONGODB_HOST/werckerunittest"
+          export PATH=$PATH:$WERCKER_SOURCE_DIR/node_modules/.bin
+          NODE_ENV=test nodeunit test lib/wercker-common/test
+    - script:
+        name: run front-end tests
+        code: |
+          yarn run frontend-test
+    - script:
+        name: test local_modules
+        code: NODE_ENV=test tap --color local_modules/*/test.js
+
+    - script:
+        name: bundle static assets
+        code: |
+          if [ -f "$WERCKER_CACHE_DIR/.cache-loader" ]; then
+            # copy previous records.json over if exists
+            cp "$WERCKER_CACHE_DIR/records.json" ./config
+          fi
+          # run yarn bulde
+          yarn run bundle
+          mv report.html stats.json $WERCKER_REPORT_ARTIFACTS_DIR
+          if [ -f "$WERCKER_CACHE_DIR/.cache-loader" ]; then
+            # remove previous records.json if exists
+            rm "$WERCKER_CACHE_DIR/records.json"
+          fi
+          # Copy records.json to cache
+          mv config/records.json $WERCKER_CACHE_DIR
+    - script:
+        name: compile server-side jsx code
+        code: |
+          yarn run build-server
+    - script:
+        name: store/move cache-loader to cache
+        code: |
+          rm -rf $WERCKER_CACHE_DIR/.cache-loader
+          mv .cache-loader $WERCKER_CACHE_DIR
+          echo "Contents of the cache dir"
+          du -h -d1 $WERCKER_CACHE_DIR
+          ls -p | grep -v /
+integration:
+  services:
+      - mongo:3.2
+  steps:
+    - script:
+        name: Add chrome to package list
+        code: |
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main"| sudo tee -a /etc/apt/sources.list
+          curl https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          apt-get update
+    - install-packages:
+        name: install system dependencies
+        packages: libfreetype6 libfontconfig ssh xserver-common xvfb google-chrome-stable netcat
+
+    - script:
+        name: setup display
+        code: |
+          export DISPLAY=:99.0
+          start-stop-daemon --start --quiet --pidfile /tmp/xvfb_99.pid --make-pidfile --background --exec /usr/bin/Xvfb -- :99 -screen 0 1280x1024x24 -ac +extension GLX +render -noreset
+    - script:
+        name: ui test
+        code: |
+          export WERCKER_MONGODB_HOST=${MONGO_PORT:6}
+          export mongodbUrl="mongodb://$WERCKER_MONGODB_HOST/werckertest"
+          export MONGODB_NAME="werckertest"
+          export NODE_ENV="development"
+          node app.js &
+          node test-ui/pre.js
+          echo "waiting for server to be ready"
+          while ! nc -vz localhost 3000; do sleep 0.3; done
+          sleep 3
+          yarn run test-ui
+    - script:
+        name: move to output dir
+        code: mv $WERCKER_ROOT/src $WERCKER_ROOT/deployment $WERCKER_OUTPUT_DIR
+
+clean:
+  steps:
+    - script:
+        name: cleanup
+        code: rm -rf $WERCKER_SOURCE_DIR/.bundle/ $WERCKER_SOURCE_DIR/vendor/
+
+    - script:
+        name: cleanup dev dependencies
+        code: |
+          yarn install --prod --pure-lockfile --cache-folder $WERCKER_CACHE_DIR
+          cp yarn.lock $WERCKER_REPORT_ARTIFACTS_DIR
+    - script:
+        name: move to output dir
+        code: |
+          mv $WERCKER_ROOT/src $WERCKER_ROOT/deployment $WERCKER_OUTPUT_DIR
+sync-cdn:
+  steps:
+    - script:
+        name: change static structure to match cdn layout
+        code: |
+          mkdir -p  public/cdn/web
+          cp -R public/out/* public/cdn/web
+    - s3sync:
+        key-id: $AWS_ACCESS_S3_KEY_ID
+        key-secret: $AWS_ACCESS_S3_KEY_SECRET
+        bucket-url: $AWS_S3_BUCKET_URL
+        source_dir: src/public/cdn/
+        delete-removed: false
+        opts: --acl-public --add-header=Cache-Control:max-age=315360000
+
+    - script:
+        name: cleanup
+        code: |
+          rm -rf public/cdn
+push-quay:
+  steps:
+    - script:
+        name: fetch wercker-specific dev dependencies
+        code: |
+          mkdir -p /dist
+          curl -o /dist/mhook https://s3.amazonaws.com/wercker-development/mhook/master/latest/linux_amd64/build
+          chmod +x /dist/mhook
+    - script:
+        name: move node modules to global dir
+        code: |
+          mkdir -p /dist
+          mv ./node_modules /dist/node_modules
+          ln -s /dist/node_modules ./node_modules
+    - internal/docker-push:
+        repository: quay.io/wercker/web-service
+        username: $DOCKER_USERNAME
+        password: $DOCKER_PASSWORD
+        registry: quay.io
+        tag: ${WERCKER_GIT_BRANCH},${WERCKER_GIT_BRANCH}-${WERCKER_GIT_COMMIT}
+        working-dir: /pipeline/source/src
+        user: 1000
+        entrypoint: >
+          /bin/bash -c
+          "mongodbUrl=\"mongodb://\$MONGODB_PORT_27017_TCP_ADDR:\$MONGODB_PORT_27017_TCP_PORT/wercker\"
+          /pipeline/source/src/app.js"
+    - script:
+        name: move to output dir
+        code: |
+          mv $WERCKER_ROOT/src $WERCKER_ROOT/deployment $WERCKER_OUTPUT_DIR
+push-quay-static:
+  box:
+    id: nginx:stable-alpine
+    cmd: /bin/sh
+  steps:
+    - script:
+        name: cleanup /usr/share/nginx/html
+        code: rm -rf /usr/share/nginx/html/*
+
+    - script:
+        name: move static files to /usr/share/nginx/html
+        code: mv $WERCKER_SOURCE_DIR/public /usr/share/nginx/html
+
+    - script:
+        name: setup nginx.config
+        code: |
+          rm /etc/nginx/conf.d/*
+          mv $WERCKER_ROOT/deployment/nginx.conf /etc/nginx/conf.d/
+    - script:
+        name: cleanup source dir
+        code: |
+          rm -rf $WERCKER_SOURCE_DIR
+          mkdir -p $WERCKER_SOURCE_DIR
+    - internal/docker-push:
+        repository: quay.io/wercker/web-static
+        username: $DOCKER_USERNAME
+        password: $DOCKER_PASSWORD
+        registry: quay.io
+        tag: ${WERCKER_GIT_BRANCH},${WERCKER_GIT_BRANCH}-${WERCKER_GIT_COMMIT}
+        cmd: nginx -g 'daemon off;'
+
+kube-deploy:
+  steps:
+    - script:
+        name: backup k8s template files
+        code: |
+          cp -r $WERCKER_ROOT/deployment $WERCKER_ROOT/deployment_original
+    - script:
+        name: prepare environment variables
+        code: |
+          export TPL_STRIPE_PUBLISHABLE_KEY_BASE64=$(printf "$TPL_STRIPE_PUBLISHABLE_KEY" | base64 -w 0)
+    - termie/bash-template:
+        name: render templates
+        cwd: $WERCKER_ROOT/deployment
+        input: "*.template.yml"
+
+    - script:
+        name: merge kubernetes files
+        cwd: $WERCKER_ROOT/deployment
+        code: |
+          rm *.template.yml
+          cat *.yml > web.yml
+          cp *.yml $WERCKER_REPORT_ARTIFACTS_DIR/
+    - kubectl:
+        name: deploy to kubernetes
+        cwd: $WERCKER_ROOT/deployment
+        server: $KUBE_URL
+        token: $KUBERNETES_TOKEN
+        insecure-skip-tls-verify: true
+        command: apply -f web.yml
+
+    - script:
+        name: restore k8s template files
+        code: |
+          rm -rf $WERCKER_ROOT/deployment
+          mv $WERCKER_ROOT/deployment_original $WERCKER_ROOT/deployment
